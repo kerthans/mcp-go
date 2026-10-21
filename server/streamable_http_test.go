@@ -13,9 +13,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -2611,6 +2613,102 @@ func TestStreamableHTTP_Delete(t *testing.T) {
 
 	assert.True(t, hookCalled)
 	assert.Equal(t, sessionID, hookSession.SessionID())
+}
+
+func TestStreamableHTTP_GetValidatesSessionID(t *testing.T) {
+	newServer := func(t *testing.T, opts ...StreamableHTTPOption) (*httptest.Server, *atomic.Int32) {
+		t.Helper()
+		var registered atomic.Int32
+		hooks := &Hooks{}
+		hooks.AddOnRegisterSession(func(context.Context, ClientSession) {
+			registered.Add(1)
+		})
+		mcpServer := NewMCPServer("test-mcp-server", "1.0", WithHooks(hooks))
+		testServer := httptest.NewServer(NewStreamableHTTPServer(mcpServer, opts...))
+		t.Cleanup(testServer.Close)
+		return testServer, &registered
+	}
+
+	initialize := func(t *testing.T, url string) string {
+		t.Helper()
+		resp, err := postJSON(url, initRequest)
+		require.NoError(t, err)
+		resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		sessionID := resp.Header.Get(HeaderKeySessionID)
+		require.NotEmpty(t, sessionID)
+		return sessionID
+	}
+
+	get := func(t *testing.T, url, sessionID string) *http.Response {
+		t.Helper()
+		ctx, cancel := context.WithCancel(t.Context())
+		t.Cleanup(cancel)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		require.NoError(t, err)
+		req.Header.Set("Accept", "text/event-stream")
+		if sessionID != "" {
+			req.Header.Set(HeaderKeySessionID, sessionID)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	t.Run("terminated session returns 404", func(t *testing.T) {
+		testServer, registered := newServer(t, WithStateful(true))
+		sessionID := initialize(t, testServer.URL)
+
+		req, err := http.NewRequest(http.MethodDelete, testServer.URL, nil)
+		require.NoError(t, err)
+		req.Header.Set(HeaderKeySessionID, sessionID)
+		resp, err := testServer.Client().Do(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		before := registered.Load()
+		resp = get(t, testServer.URL, sessionID)
+		assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+		assert.NotEqual(t, "text/event-stream", resp.Header.Get("Content-Type"))
+		assert.Equal(t, before, registered.Load(), "terminated session must not be registered again")
+	})
+
+	t.Run("unknown session returns 404", func(t *testing.T) {
+		testServer, registered := newServer(t, WithStateful(true))
+
+		for _, sessionID := range []string{"made-up-session", idPrefix + uuid.New().String()} {
+			resp := get(t, testServer.URL, sessionID)
+			assert.Equal(t, http.StatusNotFound, resp.StatusCode, "session %q", sessionID)
+		}
+		assert.Zero(t, registered.Load(), "unknown session must not be registered")
+	})
+
+	t.Run("valid session opens the stream", func(t *testing.T) {
+		testServer, _ := newServer(t, WithStateful(true))
+		sessionID := initialize(t, testServer.URL)
+
+		resp := get(t, testServer.URL, sessionID)
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "text/event-stream", resp.Header.Get("Content-Type"))
+	})
+
+	t.Run("missing session ID opens the stream", func(t *testing.T) {
+		testServer, _ := newServer(t, WithStateful(true))
+
+		resp := get(t, testServer.URL, "")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "text/event-stream", resp.Header.Get("Content-Type"))
+	})
+
+	t.Run("stateless mode ignores the session ID", func(t *testing.T) {
+		testServer, _ := newServer(t, WithStateLess(true))
+
+		resp := get(t, testServer.URL, "made-up-session")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "text/event-stream", resp.Header.Get("Content-Type"))
+	})
 }
 
 func TestStreamableHTTP_HeadReturns200(t *testing.T) {

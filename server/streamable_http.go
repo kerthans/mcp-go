@@ -1078,12 +1078,23 @@ func (s *StreamableHTTPServer) handleGet(w HTTPResponseWriter, r *HTTPRequest) {
 	}
 
 	sessionID := r.header().Get(HeaderKeySessionID)
-	// The MCP specification doesn't require validating session ID for GET requests.
+	sessionIdManager := s.resolveSessionIdManager(r)
 	// If no session ID is provided by the client, generate one using the configured SessionIdManager
 	// so that custom session id generators are honored consistently across POST/GET flows.
+	// A provided session ID is validated as on POST, so a terminated or unknown
+	// session gets 404 instead of a new stream.
 	if sessionID == "" {
-		sessionIdManager := s.resolveSessionIdManager(r)
 		sessionID = sessionIdManager.Generate()
+	} else {
+		isTerminated, err := sessionIdManager.Validate(sessionID)
+		if err != nil {
+			writeHTTPError(w, "Invalid session ID", http.StatusNotFound)
+			return
+		}
+		if isTerminated {
+			writeHTTPError(w, "Session terminated", http.StatusNotFound)
+			return
+		}
 	}
 
 	// Get or create session atomically to prevent TOCTOU races
