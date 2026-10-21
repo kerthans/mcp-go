@@ -41,7 +41,6 @@ type StdioServer struct {
 
 // toolCallWork represents a queued tool call request
 type toolCallWork struct {
-	ctx     context.Context
 	id      any // JSON-RPC id, so a recovered panic stays correlatable
 	message json.RawMessage
 	writer  io.Writer
@@ -461,7 +460,7 @@ func (s *StdioServer) toolCallWorker(ctx context.Context) {
 						resp = createErrorResponse(work.id, mcp.INTERNAL_ERROR, fmt.Sprintf("internal panic: %v", r))
 					}
 				}()
-				return s.server.HandleMessage(work.ctx, work.message)
+				return s.server.HandleMessage(ctx, work.message)
 			}()
 			if response != nil {
 				if err := s.writeResponse(response, work.writer); err != nil {
@@ -526,10 +525,15 @@ func (s *StdioServer) Listen(
 		ctx = s.contextFunc(ctx)
 	}
 
-	// Requests are served on their own goroutines. Cancelling this context when
-	// input processing ends releases any handler still blocked on it, so none
-	// outlives the session it was registered against.
-	ctx, cancelRequests := context.WithCancel(ctx)
+	// Tool call workers and the notification handler live until Listen returns,
+	// so tool calls read before EOF are still answered.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Other requests are served on their own goroutines. Cancelling this
+	// context when input processing ends releases any handler still blocked on
+	// it, so none outlives the session it was registered against.
+	requestCtx, cancelRequests := context.WithCancel(ctx)
 	defer cancelRequests()
 
 	reader := bufio.NewReader(stdin)
@@ -544,7 +548,7 @@ func (s *StdioServer) Listen(
 	go s.handleNotifications(ctx, stdout)
 
 	// Process input stream
-	err := s.processInputStream(ctx, reader, stdout)
+	err := s.processInputStream(requestCtx, reader, stdout)
 
 	// Shutdown workers gracefully
 	cancelRequests()
@@ -600,7 +604,6 @@ func (s *StdioServer) processMessage(
 		// Queue tool calls for processing by workers
 		select {
 		case s.toolCallQueue <- &toolCallWork{
-			ctx:     ctx,
 			id:      baseMessage.ID,
 			message: rawMessage,
 			writer:  writer,

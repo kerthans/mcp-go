@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -638,6 +639,83 @@ func TestStdioJoinsRequestHandlersOnEOF(t *testing.T) {
 		require.NoError(t, err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("Listen did not return once the request handler finished")
+	}
+}
+
+func TestStdioDrainsQueuedToolCallsOnEOF(t *testing.T) {
+	// A client may write its requests and close stdin before the responses
+	// arrive. Tool calls already read from the input must still be answered.
+	mcpServer := NewMCPServer("test", "1.0.0", WithToolCapabilities(true))
+	mcpServer.AddTool(mcp.NewTool("slow"), func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		time.Sleep(50 * time.Millisecond)
+		return mcp.NewToolResultText("done"), nil
+	})
+
+	stdioServer := NewStdioServer(mcpServer)
+	WithWorkerPoolSize(2)(stdioServer)
+	stdioServer.SetErrorLogger(log.New(io.Discard, "", 0))
+
+	toolCallIDs := []int{3, 4, 5, 6}
+	messages := []map[string]any{
+		{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{
+			"protocolVersion": "2024-11-05",
+			"clientInfo":      map[string]any{"name": "test-client", "version": "1.0.0"},
+		}},
+		{"jsonrpc": "2.0", "method": "notifications/initialized"},
+		{"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+	}
+	for _, id := range toolCallIDs {
+		messages = append(messages, map[string]any{
+			"jsonrpc": "2.0", "id": id, "method": "tools/call",
+			"params": map[string]any{"name": "slow"},
+		})
+	}
+	var input strings.Builder
+	for _, msg := range messages {
+		b, err := json.Marshal(msg)
+		require.NoError(t, err)
+		input.Write(b)
+		input.WriteByte('\n')
+	}
+
+	stdoutReader, stdoutWriter := io.Pipe()
+	responses := make(map[float64]map[string]any)
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		scanner := bufio.NewScanner(stdoutReader)
+		for scanner.Scan() {
+			var msg map[string]any
+			if json.Unmarshal(scanner.Bytes(), &msg) != nil {
+				continue
+			}
+			if id, ok := msg["id"].(float64); ok {
+				responses[id] = msg
+			}
+		}
+	}()
+
+	listenDone := make(chan error, 1)
+	go func() { listenDone <- stdioServer.Listen(t.Context(), strings.NewReader(input.String()), stdoutWriter) }()
+
+	select {
+	case err := <-listenDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Listen did not return after EOF")
+	}
+	require.NoError(t, stdoutWriter.Close())
+	<-readDone
+
+	for _, id := range toolCallIDs {
+		resp, ok := responses[float64(id)]
+		require.Truef(t, ok, "no response for tools/call id %d", id)
+		require.Nilf(t, resp["error"], "tools/call id %d returned an error", id)
+		result, ok := resp["result"].(map[string]any)
+		require.Truef(t, ok, "tools/call id %d has no result", id)
+		content, ok := result["content"].([]any)
+		require.Truef(t, ok && len(content) == 1, "tools/call id %d has unexpected content", id)
+		require.Equal(t, "done", content[0].(map[string]any)["text"])
 	}
 }
 
